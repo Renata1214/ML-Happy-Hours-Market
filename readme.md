@@ -162,4 +162,10 @@ The hybrid experiment also writes `hybrid_selection_log.csv`, documenting which 
 - Missing dates are not automatically equivalent to zero demand.
 - Forecast coverage is below 100% because some observations lack sufficient history.
 - Results are historical offline evaluations, not evidence of current live forecasting performance.
-- The global ML model is experimental and has not replaced the Dagster operational baseline.
+- Dagster uses a hybrid forecasting approach: global ML predictions where available, with the weekday-average baseline as a fallback.
+
+## Detailed experimental results
+
+For the complete WS3 evaluation, including baseline tuning, fair ML comparisons, STL and SARIMA benchmarks, prediction uncertainty, category forecasting, limitations, and reproducibility details, see:
+
+- [WS3 Experimental Results](WS3_RESULTS.md)
