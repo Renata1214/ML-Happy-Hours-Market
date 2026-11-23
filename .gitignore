@@ -3,3 +3,12 @@
 
 *.zip
 *.parquet
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+
+# Local environments and operating-system files
+.venv/
+venv/
+.DS_Store
