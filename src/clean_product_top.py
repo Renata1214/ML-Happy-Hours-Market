@@ -18,6 +18,14 @@ REQUIRED_COLUMNS = [
     "is_top",
 ]
 
+HOT_DEAL_STATUSES = [
+    "highlighted",
+    "not_highlighted",
+    "unknown_not_in_catalog",
+    "missing_top_record",
+]
+
+
 
 # ============================================================
 # STEP 0: LOAD DATA
@@ -216,15 +224,15 @@ def investigate_duplicate_keys(df: pd.DataFrame):
 
 def prepare_hot_deal_status(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Create an interpretable three-state representation.
+    Assign hot-deal status to existing product-top records.
 
-    The original is_top column remains nullable boolean.
+    Missing product-top records are added separately
+    after comparison with cleaned snapshots.
     """
-
     df = df.copy()
 
     df["hot_deal_status"] = pd.Series(
-        pd.NA,
+        "unknown_not_in_catalog",
         index=df.index,
         dtype="string",
     )
@@ -233,16 +241,15 @@ def prepare_hot_deal_status(df: pd.DataFrame) -> pd.DataFrame:
     false_mask = df["is_top"].eq(False).fillna(False)
 
     df.loc[true_mask, "hot_deal_status"] = "highlighted"
+    df.loc[false_mask, "hot_deal_status"] = "not_highlighted"
 
-    df.loc[false_mask, "hot_deal_status"] = (
-        "not_highlighted"
-    )
-
-    df.loc[df["is_top"].isna(), "hot_deal_status"] = (
-        "not_in_catalog"
+    df["hot_deal_status"] = pd.Categorical(
+        df["hot_deal_status"],
+        categories=HOT_DEAL_STATUSES,
     )
 
     return df
+
 
 
 # ============================================================
@@ -250,20 +257,16 @@ def prepare_hot_deal_status(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 
 def count_hot_deal_status(df: pd.DataFrame) -> dict:
-    """Count all three exposure states."""
+    """Count all four hot-deal states."""
+
+    if "hot_deal_status" not in df.columns:
+        df = prepare_hot_deal_status(df)
 
     return {
-        "highlighted": int(
-            df["is_top"].eq(True).fillna(False).sum()
-        ),
-
-        "not_highlighted": int(
-            df["is_top"].eq(False).fillna(False).sum()
-        ),
-
-        "unknown_not_in_catalog": int(
-            df["is_top"].isna().sum()
-        ),
+        status: int(
+            df["hot_deal_status"].eq(status).sum()
+        )
+        for status in HOT_DEAL_STATUSES
     }
 
 
@@ -400,15 +403,46 @@ def validate_cleaning(
         "hot_deal_status_before": original_counts,
         "hot_deal_status_after": cleaned_counts,
 
-        "unknown_values_after": int(
-            cleaned["is_top"].isna().sum()
+        "unknown_not_in_catalog_after": int(
+            cleaned["hot_deal_status"]
+            .eq("unknown_not_in_catalog")
+            .sum()
+        ),
+
+        "missing_top_records_added": int(
+            cleaned["hot_deal_status"]
+            .eq("missing_top_record")
+            .sum()
         ),
 
         "status_consistent": bool(
             (
-                cleaned["is_top"].isna()
-                == cleaned["hot_deal_status"].eq(
-                    "not_in_catalog"
+                (
+                    cleaned["is_top"].eq(True).fillna(False)
+                    & cleaned["hot_deal_status"].eq("highlighted")
+                    & cleaned["top_record_present"]
+                )
+                |
+                (
+                    cleaned["is_top"].eq(False).fillna(False)
+                    & cleaned["hot_deal_status"].eq("not_highlighted")
+                    & cleaned["top_record_present"]
+                )
+                |
+                (
+                    cleaned["is_top"].isna()
+                    & cleaned["hot_deal_status"].eq(
+                        "unknown_not_in_catalog"
+                    )
+                    & cleaned["top_record_present"]
+                )
+                |
+                (
+                    cleaned["is_top"].isna()
+                    & cleaned["hot_deal_status"].eq(
+                        "missing_top_record"
+                    )
+                    & ~cleaned["top_record_present"]
                 )
             ).all()
         ),
@@ -421,7 +455,10 @@ def validate_cleaning(
             "Preserved unresolved duplicate-key conflicts",
             "Preserved unknown is_top values",
             "Did not convert unknown to False",
-            "Created descriptive three-state hot deal status",
+            "Created four-state categorical hot deal status",
+            "Added missing date/EAN records identified from snapshots",
+            "Preserved distinction between missing is_top and missing top records",
+            "Added top_record_present to identify synthetic records",
             "Preserved EAN string identifiers",
             "Did not one-hot encode is_top",
             "Validated many-to-one snapshot join when supplied",
@@ -433,12 +470,16 @@ def validate_cleaning(
 # MAIN CLEANING FUNCTION
 # ============================================================
 
+
 def clean_product_top(
     source: str | Path | pd.DataFrame,
     snapshot_source: str | Path | pd.DataFrame | None = None,
 ):
     """
     Clean the HHM daily hot-deal indicator table.
+
+    When cleaned snapshots are supplied, add missing
+    date/EAN combinations with status 'missing_top_record'.
 
     Returns:
         cleaned_df
@@ -464,16 +505,20 @@ def clean_product_top(
     # STEP 3: INVESTIGATE DUPLICATE KEYS
     df, key_conflicts = investigate_duplicate_keys(df)
 
-    # STEP 4: PRESERVE THREE-STATE HOT DEAL FLAG
+    # STEP 4: PREPARE HOT DEAL STATUS
+    # Existing product-top records receive one of:
+    # highlighted, not_highlighted, unknown_not_in_catalog.
     df = prepare_hot_deal_status(df)
 
     # STEP 5: OPTIONAL SNAPSHOT JOIN VALIDATION
     join_report = None
+
     unmatched_snapshot_keys = pd.DataFrame(
         columns=PRIMARY_KEY
     )
 
     if snapshot_source is not None:
+
         (
             join_report,
             unmatched_snapshot_keys,
@@ -482,7 +527,52 @@ def clean_product_top(
             snapshot_source=snapshot_source,
         )
 
-    # STEP 6: FINAL VALIDATION REPORT
+        if not join_report["join_valid"]:
+            raise ValueError(
+                "Cannot add missing top records because "
+                "product-top keys are not unique."
+            )
+
+        # STEP 6: ADD MISSING TOP RECORDS
+        if not unmatched_snapshot_keys.empty:
+
+            missing_records = unmatched_snapshot_keys.copy()
+
+            # No original is_top observation exists.
+            missing_records["is_top"] = pd.Series(
+                pd.NA,
+                index=missing_records.index,
+                dtype="boolean",
+            )
+
+            missing_records["hot_deal_status"] = (
+                "missing_top_record"
+            )
+
+            df = pd.concat(
+                [df, missing_records],
+                ignore_index=True,
+            )
+
+    # STEP 7: ENSURE ALL FOUR STATUS LABELS
+    df["hot_deal_status"] = pd.Categorical(
+        df["hot_deal_status"],
+        categories=HOT_DEAL_STATUSES,
+    )
+
+    # Identify whether each record originally existed
+    # in product_top or was created from snapshots.
+    df["top_record_present"] = (
+        df["hot_deal_status"] != "missing_top_record"
+    )
+
+    # STEP 8: VALIDATE PRIMARY KEY
+    if df.duplicated(PRIMARY_KEY).any():
+        raise ValueError(
+            "Duplicate product-top primary keys remain."
+        )
+
+    # STEP 9: FINAL VALIDATION REPORT
     report = validate_cleaning(
         original=original,
         cleaned=df,
@@ -492,7 +582,7 @@ def clean_product_top(
         join_report=join_report,
     )
 
-    # STEP 7: COLLECT ANOMALIES
+    # STEP 10: COLLECT ANOMALIES
     anomalies = {
         "missing_identifier_rows": missing_identifier_rows,
         "key_conflicts": key_conflicts,

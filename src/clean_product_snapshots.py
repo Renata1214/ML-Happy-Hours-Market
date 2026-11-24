@@ -20,7 +20,8 @@ import unicodedata
 from pathlib import Path
 
 import pandas as pd
-
+import numpy as np
+from itertools import combinations
 
 # ============================================================
 # CONFIGURATION
@@ -341,25 +342,103 @@ def inspect_nulls(df: pd.DataFrame) -> dict:
     }
 
 
-def find_inventory_anomalies(df: pd.DataFrame) -> pd.DataFrame:
-    """Flag suspicious inventory values without modifying records."""
+
+def find_inventory_anomalies(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Identify inventory anomalies and assign categorical labels
+    to every snapshot record.
+
+    A row can have one or multiple anomaly types.
+
+    If there are no anomalies:
+        inventory_anomaly_label = pd.NA
+
+    If there are anomalies:
+        inventory_anomaly_label = a categorical label
+        representing the exact combination.
+
+    Returns:
+        cleaned_df_with_labels
+        inventory_anomalies_report
+
+    Inventory values are never modified.
+    """
+
+    df = df.copy()
+
+    # STEP 1: DEFINE THE ANOMALY CONDITIONS
     checks = pd.DataFrame(index=df.index)
-    checks["negative_quantity"] = df[INTEGER_COLUMNS].lt(0).any(axis=1)
-    checks["negative_price_or_weight"] = df[FLOAT_COLUMNS].lt(0).any(axis=1)
-    checks["sold_exceeds_start_of_day"] = (
-        df["quantity_sold"] > df["quantity_put_on_sale_start_of_day"]
-    )
-    checks["end_exceeds_start_of_day"] = (
-        df["quantity_end_sales"] > df["quantity_put_on_sale_start_of_day"]
+
+    checks["negative_quantity"] = (
+        df[INTEGER_COLUMNS].lt(0).any(axis=1)
     )
 
-    # Differences may also reflect replenishment or business definitions.
+    checks["negative_price_or_weight"] = (
+        df[FLOAT_COLUMNS].lt(0).any(axis=1)
+    )
+
+    checks["sold_exceeds_start_of_day"] = (
+        df["quantity_sold"]
+        > df["quantity_put_on_sale_start_of_day"]
+    )
+
+    checks["end_exceeds_start_of_day"] = (
+        df["quantity_end_sales"]
+        > df["quantity_put_on_sale_start_of_day"]
+    )
+
     checks = checks.fillna(False).astype(bool)
-    affected = checks.any(axis=1)
-    result = df.loc[affected].copy()
-    for column in checks.columns:
-        result[column] = checks.loc[affected, column]
-    return result
+
+    # STEP 2: DEFINE ALL POSSIBLE COMBINATIONS
+    anomaly_types = list(checks.columns)
+
+    # Each combination is a predefined categorical label.
+    # Bitmasks ensure deterministic combinations.
+    labels = [
+        " + ".join(
+            anomaly_types[i]
+            for i in range(len(anomaly_types))
+            if code & (1 << i)
+        )
+        for code in range(1, 2 ** len(anomaly_types))
+    ]
+
+    # STEP 3: IDENTIFY ACTIVE CONDITIONS PER ROW
+    # This is vectorized for large datasets.
+
+    mask_codes = np.zeros(
+        len(df),
+        dtype=np.uint8,
+    )
+
+    for i, column in enumerate(anomaly_types):
+        mask_codes |= (
+            checks[column].to_numpy(dtype=np.uint8)
+            << i
+        )
+
+    # STEP 4: CREATE CATEGORICAL LABEL COLUMN
+    # 0 means no anomaly.
+    # Pandas categorical code -1 represents missing.
+    df["inventory_anomaly_label"] = pd.Categorical.from_codes(
+        codes=mask_codes.astype(np.int16) - 1,
+        categories=labels,
+    )
+
+    # STEP 5: EXTRACT ANOMALOUS RECORDS
+    affected = mask_codes != 0
+
+    inventory_anomalies = df.loc[affected].copy()
+
+    # Preserve individual Boolean flags in the audit CSV.
+    for column in anomaly_types:
+        inventory_anomalies[column] = (
+            checks.loc[affected, column]
+        )
+
+    return df, inventory_anomalies.reset_index(drop=True)
 
 
 # ============================================================
@@ -465,7 +544,7 @@ def clean_product_snapshots(
     sku_ean_conflicts = find_sku_ean_conflicts(df)
     df = standardize_product_names(df)
     df = standardize_categories(df)
-    inventory_anomalies = find_inventory_anomalies(df)
+    df, inventory_anomalies = find_inventory_anomalies(df)
 
     # Re-check final key after applying corrections.
     key_conflicts = df.loc[

@@ -149,18 +149,20 @@ def standardize_types(
 
 def remove_exact_duplicates(df: pd.DataFrame):
     """
-    Remove only identical records.
-
-    Do not automatically remove duplicate composite keys.
+    Remove exact duplicate rows while preserving
+    the discarded records for auditing.
     """
-
     df = df.copy()
 
-    n_duplicates = int(df.duplicated().sum())
+    # Keep only the extra occurrences being removed.
+    exact_duplicates = df.loc[
+        df.duplicated(keep="first")
+    ].copy()
 
-    df = df.drop_duplicates().copy()
+    # Remove duplicates from the cleaned dataset.
+    df = df.drop_duplicates(keep="first").copy()
 
-    return df, n_duplicates
+    return df, exact_duplicates
 
 
 # ============================================================
@@ -408,9 +410,10 @@ def correct_pickup_ean_errors(
     ].to_numpy()
 
     # STEP 7: Validate corrections.
-    assert len(comparison) == len(df), (
-        "EAN correction changed the number of rows."
-    )
+    if len(comparison) != len(df):
+        raise ValueError(
+            "EAN correction unexpectedly changed the number of rows."
+        )
 
     remaining_mismatches = (
         comparison.loc[correction_mask, "ean_code"]
@@ -419,22 +422,10 @@ def correct_pickup_ean_errors(
         ]
     ).fillna(False)
 
-    assert not remaining_mismatches.any(), (
-        "Some corrected EANs still differ from snapshots."
-    )
-
-    assert len(comparison) == len(df), (
-        "EAN correction unexpectedly changed the number of rows."
-    )
-
-    remaining_mismatches = (
-        comparison.loc[correction_mask, "ean_code"]
-        != comparison.loc[correction_mask, "snapshot_ean_code"]
-    ).fillna(False)
-
-    assert not remaining_mismatches.any(), (
-        "Some corrected EANs still differ from snapshots."
-    )
+    if remaining_mismatches.any():
+        raise ValueError(
+            "Some corrected EANs still differ from snapshots."
+        )
 
     # STEP 8: Remove temporary mapping column.
     comparison = comparison.drop(
@@ -553,17 +544,90 @@ def calculate_totals(df: pd.DataFrame) -> dict:
 def validate_cleaning(
     original: pd.DataFrame,
     cleaned: pd.DataFrame,
-    exact_duplicates_removed: int,
+    exact_duplicates: pd.DataFrame,
     key_conflicts: pd.DataFrame,
+    duplicate_rows_removed: int,
     repeated_eans: pd.DataFrame,
     sku_ean_conflicts: pd.DataFrame,
     ean_corrections: pd.DataFrame,
     numerical_anomalies: pd.DataFrame,
     original_files: bool,
+    duplicate_totals_removed: dict,
+    price_decimals: int = 2,
 ) -> dict:
+    """
+    Generate the complete pickup-point cleaning report.
+
+    Includes:
+        - Record counts and primary-key validation.
+        - Duplicate and anomaly removal statistics.
+        - EAN corrections and remaining inconsistencies.
+        - Numerical totals before and after cleaning.
+        - Quantity and order-count totals removed.
+        - Numerical precision policy.
+        - Cleaning decisions.
+    """
 
     before = calculate_totals(original)
     after = calculate_totals(cleaned)
+
+    exact_duplicates_removed = len(exact_duplicates)
+
+    exact_duplicate_totals_removed = calculate_totals(
+        exact_duplicates
+    )
+
+    anomaly_totals_removed = calculate_totals(
+        numerical_anomalies
+    )
+
+    # Number of distinct duplicate-key groups.
+    duplicate_key_groups = int(
+        key_conflicts[PRIMARY_KEY]
+        .drop_duplicates()
+        .shape[0]
+    )
+
+    # Total number of records removed.
+    total_rows_removed = int(
+        len(original) - len(cleaned)
+    )
+
+    # Verify that removed records are accounted for.
+    expected_removed = (
+        exact_duplicates_removed
+        + len(numerical_anomalies)
+        + duplicate_rows_removed
+    )
+
+    if total_rows_removed != expected_removed:
+        raise ValueError(
+            "Record removal counts do not reconcile: "
+            f"found {total_rows_removed}, "
+            f"expected {expected_removed}."
+        )
+
+    # Validate that removed numerical totals reconcile.
+    for column in INTEGER_COLUMNS:
+        expected_difference = -(
+            anomaly_totals_removed[column]
+            + duplicate_totals_removed[column]
+        )
+
+        # Exact duplicates may also remove numerical values.
+        # Therefore, this check only applies when none
+        # were removed.
+        if exact_duplicates_removed == 0:
+            actual_difference = (
+                after[column] - before[column]
+            )
+
+            if actual_difference != expected_difference:
+                raise ValueError(
+                    f"{column} totals do not reconcile: "
+                    f"found {actual_difference}, "
+                    f"expected {expected_difference}."
+                )
 
     return {
         "original_files": original_files,
@@ -571,20 +635,27 @@ def validate_cleaning(
         "rows_before": int(len(original)),
         "rows_after": int(len(cleaned)),
 
-        "exact_duplicates_removed": (
-            exact_duplicates_removed
-        ),
-
         "primary_key": PRIMARY_KEY,
-
         "primary_key_unique": bool(
             not cleaned.duplicated(
                 subset=PRIMARY_KEY
             ).any()
         ),
 
+        "exact_duplicates_removed": int(
+            exact_duplicates_removed
+        ),
+
         "key_conflict_rows": int(
             len(key_conflicts)
+        ),
+
+        "duplicate_key_groups_detected": (
+            duplicate_key_groups
+        ),
+
+        "duplicate_key_rows_removed": int(
+            duplicate_rows_removed
         ),
 
         "repeated_ean_rows": int(
@@ -603,6 +674,10 @@ def validate_cleaning(
             len(numerical_anomalies)
         ),
 
+        "numerical_anomaly_rows_removed": int(
+            len(numerical_anomalies)
+        ),
+
         "null_counts_after": inspect_nulls(cleaned),
 
         "totals_before": before,
@@ -618,18 +693,47 @@ def validate_cleaning(
             - before["n_orders"]
         ),
 
+        "removed_records": {
+            "exact_duplicates": int(
+                exact_duplicates_removed
+            ),
+            "numerical_anomalies": int(
+                len(numerical_anomalies)
+            ),
+            "duplicate_key_rows": int(
+                duplicate_rows_removed
+            ),
+            "total_rows_removed": total_rows_removed,
+        },
+
+        "removed_totals": {
+            "numerical_anomalies": (
+                anomaly_totals_removed
+            ),
+            "duplicate_key_resolution": (
+                duplicate_totals_removed
+            ),
+            "exact_duplicates": exact_duplicates_removed,
+        },
+
+        "numerical_precision": {
+            "new_price_decimal_places": price_decimals,
+            "quantity_ordered": "integer",
+            "n_orders": "integer",
+        },
+
         "decisions": [
             "Standardized monetary prices to two decimal places",
-    "Removed exact duplicate rows",
-    "Resolved duplicate primary keys using maximum quantity_ordered",
-    "Preserved all conflicting-key rows in the audit CSV",
-    "Removed numerical anomalies from cleaned data",
-    "Preserved numerical anomalies in the audit CSV",
-    "Corrected EAN mismatches using cleaned snapshots when enabled",
-    "Preserved daily pickup-point SKU granularity",
-    "Preserved EAN identifiers as strings",
-    "Did not aggregate different SKUs into EANs",
-    "Did not encode categorical identifiers",
+            "Removed exact duplicate rows",
+            "Resolved duplicate primary keys using maximum quantity_ordered",
+            "Preserved all conflicting-key rows in the audit CSV",
+            "Removed numerical anomalies from cleaned data",
+            "Preserved numerical anomalies in the audit CSV",
+            "Corrected EAN mismatches using cleaned snapshots when enabled",
+            "Preserved daily pickup-point SKU granularity",
+            "Preserved EAN identifiers as strings",
+            "Did not aggregate different SKUs into EANs",
+            "Did not encode categorical identifiers",
         ],
     }
 
@@ -642,7 +746,6 @@ def clean_pickup_point_orders(
     source: str | Path | pd.DataFrame,
     snapshot_source: str | Path | pd.DataFrame | None = None,
     original_files: bool = False,
-    expected_ean_corrections: int | None = 29,
 ):
     """
     Clean pickup point orders.
@@ -658,12 +761,24 @@ def clean_pickup_point_orders(
     validate_schema(df)
     df = standardize_types(df)
 
+    # Treat empty identifier strings as missing.
+    for column in ["pickup_point", "sku"]:
+        df[column] = df[column].replace("", pd.NA)
+
+    # Every primary-key component must be present.
+    missing_key_mask = df[PRIMARY_KEY].isna().any(axis=1)
+
+    if missing_key_mask.any():
+        raise ValueError(
+            f"Found {missing_key_mask.sum()} rows "
+            "with missing primary-key values."
+        )
+
     original = df.copy()
 
     # STEP 1: REMOVE EXACT DUPLICATES
-    df, exact_duplicates_removed = (
-        remove_exact_duplicates(df)
-    )
+    df, exact_duplicates = remove_exact_duplicates(df)
+    exact_duplicates_removed = len(exact_duplicates)
 
     # STEP 2: OPTIONAL EAN CORRECTION
     ean_corrections = pd.DataFrame(
@@ -690,63 +805,100 @@ def clean_pickup_point_orders(
             snapshot_mapping,
         )
 
-    # STEP 3: DETECT DUPLICATE KEYS
-    df, key_conflicts, duplicate_rows_removed = resolve_pickup_key_conflicts(df)
+    # STEP 3: CAPTURE ALL DUPLICATE-KEY CONFLICTS
+    # Preserve the conflicting rows before filtering.
 
-    # STEP 4: INSPECT REPEATED EANS
-    repeated_eans = find_repeated_eans(df)
+    key_conflict_mask = df.duplicated(
+        subset=PRIMARY_KEY,
+        keep=False,
+    )
 
-    # STEP 5: INSPECT REMAINING SKU/EAN CONFLICTS
-    sku_ean_conflicts = find_sku_ean_conflicts(df)
+    key_conflicts = (
+        df.loc[key_conflict_mask]
+        .copy()
+        .reset_index(drop=True)
+    )
 
-    # STEP 6: INSPECT NUMERICAL ANOMALIES
+
+    # STEP 4: DETECT ALL NUMERICAL ANOMALIES
+    # Detect anomalies before duplicate resolution so that
+    # no anomalous records are missing from the audit CSV.
+
     numerical_anomalies = find_numerical_anomalies(df)
+
+    # Record the total measures removed due to anomalies.
+    anomaly_totals_removed = calculate_totals(
+        numerical_anomalies
+    )
+
+
+    # STEP 5: REMOVE NUMERICAL ANOMALIES
 
     if not numerical_anomalies.index.isin(df.index).all():
         raise ValueError(
             "Numerical anomaly indices do not match input rows."
         )
 
-    # Exclude detected anomalies from the cleaned data.
     df = df.drop(
         index=numerical_anomalies.index
     ).reset_index(drop=True)
 
-    # Final key validation.
+
+    # STEP 6: RESOLVE REMAINING DUPLICATE KEYS
+    # Keep the highest quantity_ordered among valid rows.
+
+    totals_before_duplicate_resolution = calculate_totals(df)
+
+    (
+        df,
+        remaining_key_conflicts,
+        duplicate_rows_removed,
+    ) = resolve_pickup_key_conflicts(df)
+
+    totals_after_duplicate_resolution = calculate_totals(df)
+
+    duplicate_totals_removed = {
+        column: (
+            totals_before_duplicate_resolution[column]
+            - totals_after_duplicate_resolution[column]
+        )
+        for column in INTEGER_COLUMNS
+    }
+
+
+    # STEP 7: RECALCULATE FINAL DIAGNOSTICS
+
+    repeated_eans = find_repeated_eans(df)
+
+    sku_ean_conflicts = find_sku_ean_conflicts(df)
+
+
+    # STEP 8: VALIDATE FINAL PRIMARY KEY
+
     if df.duplicated(PRIMARY_KEY).any():
         raise ValueError(
             "Pickup-point primary key is not unique."
         )
 
-    # STEP 7: VALIDATE
+
+    # STEP: VALIDATE
     report = validate_cleaning(
         original=original,
         cleaned=df,
         exact_duplicates_removed=exact_duplicates_removed,
         key_conflicts=key_conflicts,
+        duplicate_rows_removed=duplicate_rows_removed,
         repeated_eans=repeated_eans,
         sku_ean_conflicts=sku_ean_conflicts,
         ean_corrections=ean_corrections,
         numerical_anomalies=numerical_anomalies,
         original_files=original_files,
+        duplicate_totals_removed=duplicate_totals_removed,
     )
-
-    report["duplicate_key_rows_removed"] = int(
-    duplicate_rows_removed
-    )
-
-    report["numerical_anomaly_rows_removed"] = int(
-        len(numerical_anomalies)
-    )
-
-    report["numerical_precision"] = {
-        "new_price_decimal_places": 2,
-        "quantity_ordered": "integer",
-        "n_orders": "integer",
-    }
 
     # STEP 8: COLLECT ANOMALY TABLES
     anomalies = {
+        "exact_duplicates": exact_duplicates,
         "key_conflicts": key_conflicts,
         "repeated_eans": repeated_eans,
         "sku_ean_conflicts": sku_ean_conflicts,
