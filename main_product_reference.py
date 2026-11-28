@@ -79,12 +79,6 @@ def main() -> None:
             f"Cleaned snapshots not found: {SNAPSHOT_PATH}\n"
             "Run main_product_snapshots.py before this script."
         )
-
-    cleaned_reference, report, anomalies = clean_product_reference(
-        source=REFERENCE_PATH,
-        snapshot_source=SNAPSHOT_PATH,
-    )
-
     
     cleaned_reference,corrected_snapshots,report,anomalies, = clean_product_reference(
         source=REFERENCE_PATH,

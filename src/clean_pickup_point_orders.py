@@ -882,10 +882,11 @@ def clean_pickup_point_orders(
 
 
     # STEP: VALIDATE
+    
     report = validate_cleaning(
         original=original,
         cleaned=df,
-        exact_duplicates_removed=exact_duplicates_removed,
+        exact_duplicates=exact_duplicates,
         key_conflicts=key_conflicts,
         duplicate_rows_removed=duplicate_rows_removed,
         repeated_eans=repeated_eans,
@@ -895,6 +896,7 @@ def clean_pickup_point_orders(
         original_files=original_files,
         duplicate_totals_removed=duplicate_totals_removed,
     )
+
 
     # STEP 8: COLLECT ANOMALY TABLES
     anomalies = {
